@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+import http.client
+import json
+import argparse
+from datetime import date, datetime
+import re
+from tabulate import tabulate
+from pathlib import Path
+
+HOME = str(Path.home())
+CONFIG_FILE = f"{HOME}/.config/tuixdate.json"
+
+class TuixClient:
+
+    def __init__(self, username: str, password: str, url: str) -> None:
+        self.username = username
+        self.password = password
+        self.url = url
+        try:
+            self.conn = http.client.HTTPSConnection(url)
+            payload = json.dumps({
+                "email": username,
+                "password": password
+            })
+            headers = {
+                'Content-Type': 'application/json'
+            }
+            self.conn.request(
+                "POST", "/api/auth/v1.0.0/login", payload, headers)
+            resp = self.conn.getresponse()
+            if resp.getcode() != 200:
+                raise Exception(f"Error in tuix client: {resp.getcode()}")
+            data = resp.read()
+            self.user = json.loads(str(data.decode("utf-8")))
+            self.token_id = resp.getheader("x-juaapp-jwt")
+            # print(self.user)
+            # print(self.token_id)
+        except Exception as e:
+            raise e
+
+    def send_request(self, method, url, payload=None):
+        headers = {
+            "x-juaapp-jwt": self.token_id,
+            'Content-Type': 'application/json'
+        }
+        # print(f">> {method} {url}")
+        self.conn.request(method, url, payload, headers=headers)
+        resp = self.conn.getresponse()
+        data = resp.read()
+        resp = json.loads(str(data.decode("utf-8")))
+        return resp
+
+    def list_project(self):
+        return self.send_request("GET", "/api/freelancer/v1.0.0/projects")["items"]
+
+    def get_project_by_name(self, name):
+        resp = self.list_project()
+        for item in resp:
+            if item["name"] == name:
+                return item["id"], item["name"]
+        return None, None
+
+    def get_timesheets(self, project_id, status=None, date=None) -> list:
+        timesheets = []
+        resp = self.send_request(
+            "GET", f"/api/freelancer/v1.0.0/timesheets?project={project_id}")
+        for item in resp["items"]:
+            if status and item["status"] != status:
+                continue
+            if date and item["from"] != date.strftime("%Y-%m-01"):
+                continue
+            timesheets.append({
+                "id": item["id"],
+                "from": item["from"],
+                "to": item["to"],
+                "status": item["status"]
+            })
+        return timesheets
+
+    def get_timesheets_entries(self, timesheet_id, date=None):
+        entries = []
+        resp = self.send_request(
+            "GET", f"/api/freelancer/v1.0.0/timesheets/{timesheet_id}/entries")
+        for item in resp["items"]:
+            if date and item["date"] != date.strftime("%Y-%m-%d"):
+                continue
+            entries.append({
+                "id": item["id"],
+                "date": item["date"],
+                "checkIn": item["checkIn"],
+                "checkOut": item["checkOut"],
+                "pause": item["pause"],
+                "hours": item["hours"],
+                "comments": item["comments"],
+            })
+        return entries
+
+    def update_timesheets(self, project_name: str, date, checkIn=None, checkOut=None, pause: int = 0, comments: str = None):
+        project_id, name = self.get_project_by_name(project_name)
+        if project_id:
+            timesheets = self.get_timesheets(project_id, "OPEN", date)
+            if len(timesheets) == 1:
+                timesheet_id = timesheets[0]["id"]
+                entries = self.get_timesheets_entries(timesheet_id, date)
+                if len(entries) == 1:
+                    entry_id = entries[0]["id"]
+                    path_data = {
+                        "checkIn": checkIn.strftime("%H:%M") if checkIn else None,
+                        "checkOut": checkOut.strftime("%H:%M") if checkIn else None,
+                        "pause": pause,
+                        "comments": comments if comments else "", 
+                    }
+                    if not checkIn and not checkOut:
+                        path_data["hours"] = 0
+                    payload = json.dumps(path_data)
+                    return self.send_request(
+                        "PATCH", f"/api/freelancer/v1.0.0/timesheets/{timesheet_id}/entries/{entry_id}", payload=payload)
+                    
+        else:
+            print(f"Not project ({project_name}) fount")
+
+    def list_timesheets(self, project_name, date=None) -> list:
+        project_id, name = self.get_project_by_name(project_name)
+        if project_id:
+            return self.get_timesheets(project_id, "OPEN", date)
+        else:
+            print(f"Not project ({project_name}) fount")
+
+    def list_timesheets_entries(self, project_name, _date, listAll = False) -> list:
+        project_id, name = self.get_project_by_name(project_name)
+        if project_id:
+            timesheets = self.get_timesheets(project_id, None, date.today() if not _date else _date)
+            if len(timesheets) == 1:
+                timesheet_id = timesheets[0]["id"]
+                return self.get_timesheets_entries(timesheet_id, None if listAll else _date)
+        else:
+            print(f"Not project ({project_name}) fount")
+
+def check_value(value):
+    match = re.match(
+        "((?P<hour>[0-9]{1,2}):(?P<minutes>[0-9]{2})( (?P<daytime>[PA]M))?)", value)
+    if match:
+        if match.group("daytime"):
+            return datetime.strptime(value, "%I:%M %p")
+        else:
+            return datetime.strptime(value, "%H:%M")
+    raise argparse.ArgumentTypeError(
+        "must be in the form HH:MM PM|AM or 24HH:MM")
+
+
+def check_date(value):
+    if re.match("(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})", value):
+        return datetime.strptime(value, "%Y-%m-%d")
+    raise argparse.ArgumentTypeError("must be in the form YYYY-mm-dd")
+
+def check_date_month(value):
+    if re.match("(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})", value):
+        return datetime.strptime(value, "%Y-%m-%d")
+    elif re.match("(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})", value):
+        return value
+    raise argparse.ArgumentTypeError("must be in the form YYYY-mm-dd or YYYY-mm")
+
+def main():
+    """
+        tuixdate push "project" ...
+        tuixdate delete "project" ["date"]
+        tuixdate projects
+        tuixdate timesheet "project" ["date or month"]
+    """
+
+    parser = argparse.ArgumentParser()
+
+    subparser = parser.add_subparsers(help="Commands", dest="command")
+
+    push_parser = subparser.add_parser("push")
+    clean_parser = subparser.add_parser("clean")
+    list_parser = subparser.add_parser("list")
+    project_p = subparser.add_parser("projects")
+    timesheet_p = subparser.add_parser("timesheet")
+
+    push_parser.add_argument("project", type=str, help="Set project name")
+    push_parser.add_argument("check_in", type=check_value,
+                             help="Set checkIn HH:MM PM|AM or 24HH:MM")
+    push_parser.add_argument(
+        "check_out", type=check_value, help="Set checkOut HH:MM PM|AM")
+    push_parser.add_argument("pause", type=int, help="Set pause 0..N minutes")
+    push_parser.add_argument("comments", type=str, help="Set comments")
+    push_parser.add_argument("date", type=check_date, nargs='?', default=date.today(
+    ), help="Date YYYY-MM-DD, default: current day")
+
+    clean_parser.add_argument("project", type=str, help="Set project name")
+    clean_parser.add_argument("date", type=check_date, nargs='?', default=date.today(
+    ), help="Date YYYY-MM-DD, default: current day")
+
+    list_parser.add_argument("project", type=str, help="Set project name")
+    list_parser.add_argument("date", type=check_date, nargs='?',default=date.today(
+    ), help="Date YYYY-MM-DD, default: current day")
+
+    timesheet_p.add_argument("project", type=str, help="Set project name")
+    timesheet_p.add_argument("date", type=check_date_month, nargs='?',default=None, help="Date YYYY-MM-DD, default: current day")
+
+    args = parser.parse_args()
+
+    config = {}
+    try:
+        with open(CONFIG_FILE, 'r') as file:
+            _config = json.load(file)
+            config["username"] = _config["username"]
+            config["password"] = _config["password"]
+            config["host"] = _config["host"]
+    except FileNotFoundError:
+        print(f"tuixdate: 🚨 Accounts config not found, create the file {CONFIG_FILE}")
+        print("""Template:
+        {
+            "username": "pepe",
+            "password": "pepe1234",
+            "host": "app.tuix.ch"
+        }
+        """)
+        exit(1)
+    except KeyError as e:
+        print("Value not found in config file, " + str(e))
+        exit(1)
+
+    tuix_cli = TuixClient(config["username"],
+                          config["password"],
+                          config["host"])
+
+    if args.command == "push":
+        tuix_cli.update_timesheets(
+            args.project, args.date, args.check_in, args.check_out, args.pause, args.comments)
+
+    elif args.command == "clean":
+        entry = tuix_cli.update_timesheets(args.project, args.date)
+        table = []
+        table.append([entry["date"], entry["checkIn"], entry["checkOut"], entry["pause"], entry["hours"], entry["comments"]])
+        print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'Hours', 'comments']))
+
+    elif args.command == "list":
+        timesheets = tuix_cli.list_timesheets(args.project, args.date)
+        table = []
+        for timesheet in timesheets:
+            table.append([timesheet["id"], timesheet["from"], timesheet["to"], timesheet["status"],])
+        print(tabulate(table, headers=['ID', 'From', 'To', 'Status']))
+        if args.date:
+            timesheet_entries = tuix_cli.list_timesheets_entries(args.project, args.date)
+            table = []
+            for entries in timesheet_entries:
+                table.append([entries["date"], entries["checkIn"], entries["checkOut"], entries["pause"], entries["comments"]])
+            print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'comments']))
+
+    elif args.command == "projects":
+        projects = tuix_cli.list_project()
+        table = []
+        for project in projects:
+            table.append([project["name"]])
+        print(tabulate(table, headers=['Name']))
+
+    elif args.command == "timesheet":
+        listAll = False
+        _date = args.date
+        if re.match("^(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})$", str(_date)):
+            listAll = True
+            _date = datetime.strptime(_date + "-01", "%Y-%m-%d")
+
+        timesheet_entries = tuix_cli.list_timesheets_entries(args.project, _date, listAll)
+        table = []
+        for entries in timesheet_entries:
+            table.append([entries["date"], entries["checkIn"], entries["checkOut"], entries["pause"], entries["hours"], entries["comments"]])
+        print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'Hours', 'comments']))
+
+
+if __name__ == '__main__':
+    main()
