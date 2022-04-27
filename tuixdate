@@ -3,12 +3,30 @@ import http.client
 import json
 import argparse
 from datetime import date, datetime
+import logging
 import re
 from tabulate import tabulate
 from pathlib import Path
+from termcolor import colored
+import getpass
 
 HOME = str(Path.home())
 CONFIG_FILE = f"{HOME}/.config/tuixdate.json"
+
+
+class Printer:
+
+    def print_timesheet(timeshift: list, fields: list, headers: list = []):
+        if not headers:
+            headers = fields
+        table = []
+        for item in timeshift:
+            row = []
+            for field in fields:
+                row.append(item[field])
+            table.append(row)
+        print(tabulate(table, headers=[header.upper() for header in fields]))
+
 
 class TuixClient:
 
@@ -29,7 +47,7 @@ class TuixClient:
                 "POST", "/api/auth/v1.0.0/login", payload, headers)
             resp = self.conn.getresponse()
             if resp.getcode() != 200:
-                raise Exception(f"Error in tuix client: {resp.getcode()}")
+                raise Exception(f"Login failed, {resp.getcode()}")
             data = resp.read()
             self.user = json.loads(str(data.decode("utf-8")))
             self.token_id = resp.getheader("x-juaapp-jwt")
@@ -108,14 +126,14 @@ class TuixClient:
                         "checkIn": checkIn.strftime("%H:%M") if checkIn else None,
                         "checkOut": checkOut.strftime("%H:%M") if checkIn else None,
                         "pause": pause,
-                        "comments": comments if comments else "", 
+                        "comments": comments if comments else "",
                     }
                     if not checkIn and not checkOut:
                         path_data["hours"] = 0
                     payload = json.dumps(path_data)
                     return self.send_request(
-                        "PATCH", f"/api/freelancer/v1.0.0/timesheets/{timesheet_id}/entries/{entry_id}", payload=payload)
-                    
+                        "PATCH", f"/api/freelancer/v1.0.0/timesheets/{timesheet_id}/entries/{entry_id}", payload)
+
         else:
             print(f"Not project ({project_name}) fount")
 
@@ -126,15 +144,17 @@ class TuixClient:
         else:
             print(f"Not project ({project_name}) fount")
 
-    def list_timesheets_entries(self, project_name, _date, listAll = False) -> list:
+    def list_timesheets_entries(self, project_name, _date, listAll=False) -> list:
         project_id, name = self.get_project_by_name(project_name)
         if project_id:
-            timesheets = self.get_timesheets(project_id, None, date.today() if not _date else _date)
+            timesheets = self.get_timesheets(
+                project_id, None, date.today() if not _date else _date)
             if len(timesheets) == 1:
                 timesheet_id = timesheets[0]["id"]
                 return self.get_timesheets_entries(timesheet_id, None if listAll else _date)
         else:
             print(f"Not project ({project_name}) fount")
+
 
 def check_value(value):
     match = re.match(
@@ -153,12 +173,15 @@ def check_date(value):
         return datetime.strptime(value, "%Y-%m-%d")
     raise argparse.ArgumentTypeError("must be in the form YYYY-mm-dd")
 
+
 def check_date_month(value):
     if re.match("(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})-(?P<day>[0-9]{1,2})", value):
         return datetime.strptime(value, "%Y-%m-%d")
     elif re.match("(?P<year>[0-9]{4})-(?P<month>[0-9]{1,2})", value):
         return value
-    raise argparse.ArgumentTypeError("must be in the form YYYY-mm-dd or YYYY-mm")
+    raise argparse.ArgumentTypeError(
+        "must be in the form YYYY-mm-dd or YYYY-mm")
+
 
 def main():
     """
@@ -177,6 +200,7 @@ def main():
     list_parser = subparser.add_parser("list")
     project_p = subparser.add_parser("projects")
     timesheet_p = subparser.add_parser("timesheet")
+    login = subparser.add_parser("login")
 
     push_parser.add_argument("project", type=str, help="Set project name")
     push_parser.add_argument("check_in", type=check_value,
@@ -193,38 +217,48 @@ def main():
     ), help="Date YYYY-MM-DD, default: current day")
 
     list_parser.add_argument("project", type=str, help="Set project name")
-    list_parser.add_argument("date", type=check_date, nargs='?',default=date.today(
+    list_parser.add_argument("date", type=check_date, nargs='?', default=date.today(
     ), help="Date YYYY-MM-DD, default: current day")
 
     timesheet_p.add_argument("project", type=str, help="Set project name")
-    timesheet_p.add_argument("date", type=check_date_month, nargs='?',default=None, help="Date YYYY-MM-DD, default: current day")
+    timesheet_p.add_argument("date", type=check_date_month, nargs='?',
+                             default=None, help="Date YYYY-MM-DD, default: current day")
+
+    login.add_argument("user", type=str, help="Set Tuix username")
+    login.add_argument("host", nargs='?', type=str,
+                       default="app.tuix.ch", help="Tuix hostname")
+
+    login.add_argument('-P', nargs='?', dest='password')
 
     args = parser.parse_args()
 
     config = {}
-    try:
-        with open(CONFIG_FILE, 'r') as file:
-            _config = json.load(file)
-            config["username"] = _config["username"]
-            config["password"] = _config["password"]
-            config["host"] = _config["host"]
-    except FileNotFoundError:
-        print(f"tuixdate: 🚨 Accounts config not found, create the file {CONFIG_FILE}")
-        print("""Template:
-        {
-            "username": "pepe",
-            "password": "pepe1234",
-            "host": "app.tuix.ch"
-        }
-        """)
-        exit(1)
-    except KeyError as e:
-        print("Value not found in config file, " + str(e))
-        exit(1)
 
-    tuix_cli = TuixClient(config["username"],
-                          config["password"],
-                          config["host"])
+    if not args.command == "login":
+        try:
+            with open(CONFIG_FILE, 'r') as file:
+                _config = json.load(file)
+                config["username"] = _config["username"]
+                config["password"] = _config["password"]
+                config["host"] = _config["host"]
+        except FileNotFoundError:
+            print(
+                f"tuixdate: 🚨 Accounts config not found, create the file {CONFIG_FILE} or execute: tuixdate login <your_username>")
+            print("""Template:
+            {
+                "username": "pepe",
+                "password": "pepe1234",
+                "host": "app.tuix.ch"
+            }
+            """)
+            exit(1)
+        except KeyError as e:
+            print("Value not found in config file, " + str(e))
+            exit(1)
+
+        tuix_cli = TuixClient(config["username"],
+                            config["password"],
+                            config["host"])
 
     if args.command == "push":
         tuix_cli.update_timesheets(
@@ -233,21 +267,27 @@ def main():
     elif args.command == "clean":
         entry = tuix_cli.update_timesheets(args.project, args.date)
         table = []
-        table.append([entry["date"], entry["checkIn"], entry["checkOut"], entry["pause"], entry["hours"], entry["comments"]])
-        print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'Hours', 'comments']))
+        table.append([entry["date"], entry["checkIn"], entry["checkOut"],
+                     entry["pause"], entry["hours"], entry["comments"]])
+        print(tabulate(table, headers=[
+              'Date', 'checkIn', 'checkOut', 'pause', 'Hours', 'comments']))
 
     elif args.command == "list":
         timesheets = tuix_cli.list_timesheets(args.project, args.date)
         table = []
         for timesheet in timesheets:
-            table.append([timesheet["id"], timesheet["from"], timesheet["to"], timesheet["status"],])
+            table.append([timesheet["id"], timesheet["from"],
+                         timesheet["to"], timesheet["status"], ])
         print(tabulate(table, headers=['ID', 'From', 'To', 'Status']))
         if args.date:
-            timesheet_entries = tuix_cli.list_timesheets_entries(args.project, args.date)
+            timesheet_entries = tuix_cli.list_timesheets_entries(
+                args.project, args.date)
             table = []
             for entries in timesheet_entries:
-                table.append([entries["date"], entries["checkIn"], entries["checkOut"], entries["pause"], entries["comments"]])
-            print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'comments']))
+                table.append([entries["date"], entries["checkIn"],
+                             entries["checkOut"], entries["pause"], entries["comments"]])
+            print(tabulate(table, headers=[
+                  'Date', 'checkIn', 'checkOut', 'pause', 'comments']))
 
     elif args.command == "projects":
         projects = tuix_cli.list_project()
@@ -263,11 +303,28 @@ def main():
             listAll = True
             _date = datetime.strptime(_date + "-01", "%Y-%m-%d")
 
-        timesheet_entries = tuix_cli.list_timesheets_entries(args.project, _date, listAll)
-        table = []
-        for entries in timesheet_entries:
-            table.append([entries["date"], entries["checkIn"], entries["checkOut"], entries["pause"], entries["hours"], entries["comments"]])
-        print(tabulate(table, headers=['Date', 'checkIn', 'checkOut', 'pause', 'Hours', 'comments']))
+        timesheet_entries = tuix_cli.list_timesheets_entries(
+            args.project, _date, listAll)
+        Printer.print_timesheet(timesheet_entries, [
+                                'date', 'checkIn', 'checkOut', 'pause', 'hours', 'comments'])
+
+    elif args.command == "login":
+        if not args.password:
+            args.password = getpass.getpass()
+        config = {
+            "username": args.user,
+            "password": args.password,
+            "host": args.host
+        }
+        try:
+            TuixClient(config["username"], config["password"], config["host"])
+
+            with open(CONFIG_FILE, 'w') as outfile:
+                json.dump(config, outfile, indent=2)
+
+            print("Login success")
+        except Exception as e:
+            print(e)
 
 
 if __name__ == '__main__':
