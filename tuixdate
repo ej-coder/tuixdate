@@ -3,12 +3,14 @@ import http.client
 import json
 import argparse
 from datetime import date, datetime
-import logging
 import re
 from tabulate import tabulate
 from pathlib import Path
 from termcolor import colored
 import getpass
+from datetime import datetime, timedelta
+import re
+from urllib.parse import quote
 
 HOME = str(Path.home())
 CONFIG_FILE = f"{HOME}/.config/tuixdate.json"
@@ -26,6 +28,85 @@ class Printer:
                 row.append(item[field])
             table.append(row)
         print(tabulate(table, headers=[header.upper() for header in fields]))
+
+
+class TrelloClient:
+
+    def __init__(self, username, apiKey, token, boardName):
+        self.username = username
+        self.apiKey = apiKey
+        self.token = token
+        self.boardName = boardName
+        self.headers = {
+            'Cookie': 'dsc=68346d752217aca9979ae0ba828bb742f9a5ee9e4ab9d73eb3d01b7410cb8194; preAuthProps=s%3A61f05e692995cd122e1815d9%3AisEnterpriseAdmin%3Dfalse.tS%2Bl%2FwL%2BubdUbx%2B65u8ZbPfZEY6cvpx%2FfzWy2Wer1Pc'
+        }
+        self.conn = http.client.HTTPSConnection("api.trello.com")
+
+    def get_board(self):
+        payload = ''
+        headers = self.headers
+        headers['Accept'] = 'application/json'
+        url = f"/1/members/{self.username}/boards?key={self.apiKey}&token={self.token}"
+        self.conn.request("GET", url, payload, headers)
+        res = self.conn.getresponse()
+        data = res.read()
+        boards = json.loads(data.decode("utf-8"))
+        for board in boards:
+            if board['name'] == self.boardName:
+                return board
+        return None
+
+    def get_actions(self, date: datetime):
+
+        board_id = self.get_board()['id']
+
+        before_date = date + timedelta(days=1)
+        since = quote(date.strftime("%b %d %Y EDT"))
+        before = quote(before_date.strftime("%b %d %Y EDT"))
+        payload = ''
+        self.conn.request(
+            "GET", f"/1/boards/{board_id}/actions?filter=commentCard&key={self.apiKey}&token={self.token}&limit=1000&since={since}&before={before}", payload, self.headers)
+        res = self.conn.getresponse()
+        data = res.read()
+        actions = json.loads(data.decode("utf-8"))
+        cards_update_ids = []
+        for action in actions:
+            card_id = action['data']['card']['id']
+            # card_name = action['data']['card']['name']
+            # update = datetime.strptime(action['date'], '%Y-%m-%dT%H:%M:%S.%f%z')
+            # comment = action['data']['text']
+            # print(card_id, update, action['memberCreator']['username'])
+            if action['memberCreator']['username'] == "ericson_tuix":
+                cards_update_ids.append(card_id)
+        cards_update_ids = list(dict.fromkeys(cards_update_ids))
+        # print(cards_update_ids)
+        branches = []
+        for card_id in cards_update_ids:
+            card = self.get_card(card_id)
+            # print('------------------------------')
+            # print(card['desc'])
+            branches.append(card['branch'])
+        print(';'.join(branches))
+
+    def get_card(self, card_id):
+        payload = ''
+        headers = self.headers
+        headers['Accept'] = 'application/json'
+        self.conn.request(
+            "GET", f"/1/cards/{card_id}?key={self.apiKey}&token={self.token}", payload, headers)
+        res = self.conn.getresponse()
+        data = res.read()
+        card = json.loads(data.decode("utf-8"))
+        desc = card['desc']
+        branch = ''
+        branch_regex = r".*\*\*branch[\*\*]*:[\*\*]*\s(?P<branch>[\w\_-]+).*"
+        matches = re.search(branch_regex, desc)
+        if matches:
+            branch = matches['branch']
+        return {
+            'desc': desc,
+            'branch': branch
+        }
 
 
 class TuixClient:
@@ -201,6 +282,7 @@ def main():
     project_p = subparser.add_parser("projects")
     timesheet_p = subparser.add_parser("timesheet")
     login = subparser.add_parser("login")
+    trello = subparser.add_parser("trello")
 
     push_parser.add_argument("project", type=str, help="Set project name")
     push_parser.add_argument("check_in", type=check_value,
@@ -224,11 +306,13 @@ def main():
     timesheet_p.add_argument("date", type=check_date_month, nargs='?',
                              default=None, help="Date YYYY-MM-DD, default: current day")
 
-    login.add_argument("user", type=str, help="Set Tuix username")
+    login.add_argument("username", nargs='?', type=str, help="Set Tuix username")
     login.add_argument("host", nargs='?', type=str,
                        default="app.tuix.ch", help="Tuix hostname")
-
     login.add_argument('-P', nargs='?', dest='password')
+
+    trello.add_argument("date", type=check_date, nargs='?', default=date.today(
+    ), help="Date YYYY-MM-DD, default: current day")
 
     args = parser.parse_args()
 
@@ -237,10 +321,8 @@ def main():
     if not args.command == "login":
         try:
             with open(CONFIG_FILE, 'r') as file:
-                _config = json.load(file)
-                config["username"] = _config["username"]
-                config["password"] = _config["password"]
-                config["host"] = _config["host"]
+                config = json.load(file)
+
         except FileNotFoundError:
             print(
                 f"tuixdate: 🚨 Accounts config not found, create the file {CONFIG_FILE} or execute: tuixdate login <your_username>")
@@ -257,8 +339,8 @@ def main():
             exit(1)
 
         tuix_cli = TuixClient(config["username"],
-                            config["password"],
-                            config["host"])
+                              config["password"],
+                              config["host"])
 
     if args.command == "push":
         tuix_cli.update_timesheets(
@@ -308,14 +390,45 @@ def main():
         Printer.print_timesheet(timesheet_entries, [
                                 'date', 'checkIn', 'checkOut', 'pause', 'hours', 'comments'])
 
+    elif args.command == "trello":
+        # print(config)
+        if not 'trello_apiKey' in config:
+            print(f"Add Trello API Key in {CONFIG_FILE}")
+            return
+        if not 'trello_token' in config:
+            print(f"Add Trello Token Key in {CONFIG_FILE}")
+            return
+        if not 'trello_boardName' in config:
+            print(f"Add Trello API BoardName in {CONFIG_FILE}")
+            return
+        if not 'trello_username' in config:
+            print(f"Add Trello API username in {CONFIG_FILE}")
+            return
+        
+        trello_cli = TrelloClient(config['trello_username'], config['trello_apiKey'], config['trello_token'], config['trello_boardName'])
+        trello_cli.get_actions(args.date)
+
     elif args.command == "login":
+        if not args.username:
+            args.username = input('username: ')
         if not args.password:
             args.password = getpass.getpass()
+
+        trello_username = input('Trello username: ')
+        trello_apiKey = input('Trello apiKey: ')
+        trello_token = input('Trello token: ')
+        trello_boardName = input('Trello board: ')
+        
         config = {
-            "username": args.user,
+            "username": args.username,
             "password": args.password,
-            "host": args.host
+            "host": args.host,
+            "trello_apiKey": trello_apiKey,
+            "trello_token": trello_token,
+            "trello_boardName": trello_boardName,
+            "trello_username": trello_username
         }
+
         try:
             TuixClient(config["username"], config["password"], config["host"])
 
